@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sqlite3
 import threading
 import time
 from collections import Counter, deque
@@ -42,6 +43,7 @@ else:
 MODEL_PATH = "model.h5"
 LABELS_PATH = "labels.txt"
 HISTORY_PATH = "history.txt"
+LEXICON_DB_PATH = "lexicon.db"
 
 SEQUENCE_LEN = 30
 PREDICTION_THRESHOLD = 0.90
@@ -59,6 +61,122 @@ FALLBACK_VOCAB = [
 ]
 
 
+def number_to_russian(n: int) -> str:
+    """Преобразует число 0..9999 в русскую текстовую форму."""
+    if n == 0:
+        return "ноль"
+
+    ones_m = ["", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"]
+    ones_f = ["", "одна", "две", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"]
+    teens = ["десять", "одиннадцать", "двенадцать", "тринадцать", "четырнадцать", "пятнадцать", "шестнадцать", "семнадцать", "восемнадцать", "девятнадцать"]
+    tens = ["", "", "двадцать", "тридцать", "сорок", "пятьдесят", "шестьдесят", "семьдесят", "восемьдесят", "девяносто"]
+    hundreds = ["", "сто", "двести", "триста", "четыреста", "пятьсот", "шестьсот", "семьсот", "восемьсот", "девятьсот"]
+
+    parts: List[str] = []
+
+    if n >= 1000:
+        t = n // 1000
+        if t == 1:
+            parts.append("тысяча")
+        elif t == 2:
+            parts.append("две тысячи")
+        elif t in (3, 4):
+            parts.append(f"{ones_f[t]} тысячи")
+        else:
+            parts.append(f"{ones_m[t]} тысяч")
+        n = n % 1000
+
+    h = n // 100
+    if h:
+        parts.append(hundreds[h])
+    n = n % 100
+
+    if 10 <= n <= 19:
+        parts.append(teens[n - 10])
+        return " ".join([p for p in parts if p]).strip()
+
+    t = n // 10
+    if t:
+        parts.append(tens[t])
+    o = n % 10
+    if o:
+        parts.append(ones_m[o])
+
+    return " ".join([p for p in parts if p]).strip()
+
+
+class LexiconDB:
+    """SQLite-база словаря (1000+ слов/фраз) для пост-обработки меток."""
+
+    def __init__(self, db_path: str = LEXICON_DB_PATH) -> None:
+        self.db_path = db_path
+        self._ensure_db()
+
+    def _ensure_db(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lexicon (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token TEXT UNIQUE NOT NULL,
+                    category TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+        if self.count_tokens() < 1000:
+            self._bootstrap_tokens()
+
+    def _bootstrap_tokens(self) -> None:
+        common_words = [
+            "привет", "пока", "да", "нет", "спасибо", "пожалуйста", "извини", "помоги", "стоп", "быстро",
+            "медленно", "вверх", "вниз", "влево", "вправо", "я", "ты", "мы", "они", "он", "она",
+            "работа", "дом", "школа", "университет", "больница", "аптека", "магазин", "метро", "автобус",
+            "поезд", "машина", "улица", "город", "деревня", "друг", "семья", "мама", "папа", "ребенок",
+            "врач", "учитель", "студент", "еда", "вода", "чай", "кофе", "завтрак", "обед", "ужин",
+            "сегодня", "завтра", "вчера", "утро", "день", "вечер", "ночь", "хорошо", "плохо", "отлично",
+            "опасно", "безопасно", "тепло", "холодно", "рад", "грустно", "злой", "тихо", "громко", "повтори",
+        ]
+
+        # 1201 числовая фраза: от 0 до 1200.
+        number_tokens = [number_to_russian(i) for i in range(0, 1201)]
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.executemany(
+                "INSERT OR IGNORE INTO lexicon(token, category) VALUES(?, ?)",
+                [(w, "common") for w in common_words],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO lexicon(token, category) VALUES(?, ?)",
+                [(w, "number") for w in number_tokens],
+            )
+            conn.commit()
+
+    def count_tokens(self) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT COUNT(*) FROM lexicon")
+            return int(cur.fetchone()[0])
+
+    def token_by_id(self, idx: int) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT token FROM lexicon WHERE id = ?", (idx,))
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def resolve(self, raw_label: str) -> str:
+        """Пытается преобразовать метку в слово из базы:
+        - если метка числовая (например, '42'), возвращает token по id;
+        - иначе возвращает как есть.
+        """
+        txt = raw_label.strip()
+        if txt.isdigit():
+            token = self.token_by_id(int(txt))
+            if token:
+                return token
+        return raw_label
+
+
 @dataclass
 class RecognitionEvent:
     text: str
@@ -71,7 +189,8 @@ class RecognitionEvent:
 class DynamicGestureRecognizer:
     """Распознавание динамических жестов по последовательности landmarks."""
 
-    def __init__(self) -> None:
+    def __init__(self, lexicon_db: Optional[LexiconDB] = None) -> None:
+        self.lexicon_db = lexicon_db
         self.model = None
         self.labels: List[str] = []
         self.use_ml_model = False
@@ -274,7 +393,8 @@ class DynamicGestureRecognizer:
             best_idx = int(np.argmax(probs))
             best_prob = float(probs[best_idx])
             if best_prob >= PREDICTION_THRESHOLD and best_idx < len(self.labels):
-                voted = self._emit_with_voting(self.labels[best_idx])
+                resolved = self.lexicon_db.resolve(self.labels[best_idx]) if self.lexicon_db else self.labels[best_idx]
+                voted = self._emit_with_voting(resolved)
                 self.last_emit_time = now
                 return voted
             return None
@@ -293,7 +413,8 @@ class SignLanguageApp:
         self.root.title(WINDOW_TITLE)
         self.root.geometry("1200x760")
 
-        self.recognizer = DynamicGestureRecognizer()
+        self.lexicon_db = LexiconDB()
+        self.recognizer = DynamicGestureRecognizer(self.lexicon_db)
 
         self.mp_hands = mp.solutions.hands
         self.mp_draw = mp.solutions.drawing_utils
@@ -331,7 +452,7 @@ class SignLanguageApp:
     def _status_text(self) -> str:
         if self.recognizer.use_ml_model:
             return "Режим: ML-модель (рекомендуется для точности >=90%)"
-        return f"Режим: fallback-словарь ({len(FALLBACK_VOCAB)} фраз), подключите model.h5 для лучшей точности"
+        return f"Режим: fallback-словарь ({len(FALLBACK_VOCAB)} фраз) + БД {self.lexicon_db.count_tokens()} слов, подключите model.h5 для лучшей точности"
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
