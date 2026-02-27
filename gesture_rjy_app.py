@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sqlite3
 import threading
@@ -44,6 +45,7 @@ MODEL_PATH = "model.h5"
 LABELS_PATH = "labels.txt"
 HISTORY_PATH = "history.txt"
 LEXICON_DB_PATH = "lexicon.db"
+USER_GESTURES_PATH = "user_gestures.json"
 
 SEQUENCE_LEN = 30
 PREDICTION_THRESHOLD = 0.90
@@ -177,6 +179,81 @@ class LexiconDB:
         return raw_label
 
 
+class UserGestureConfig:
+    """JSON-конфиг для пользовательских жестов и переименования меток.
+
+    Файл user_gestures.json можно редактировать вручную:
+    - label_map: переименование ML-меток (или fallback-меток) в удобный текст.
+    - fallback_rules: простые правила для эвристического режима.
+    """
+
+    DEFAULT_DATA = {
+        "label_map": {
+            "ПРИВЕТ": "Привет!",
+            "ПОКА": "Пока!"
+        },
+        "fallback_rules": [
+            {
+                "name": "custom_help",
+                "motion": "still",
+                "fingers": [1, 0, 0, 0, 1],
+                "output": "ПОМОГИТЕ МНЕ"
+            }
+        ]
+    }
+
+    def __init__(self, path: str = USER_GESTURES_PATH) -> None:
+        self.path = path
+        self.data = self._load_or_create()
+
+    def _load_or_create(self) -> Dict:
+        if not os.path.exists(self.path):
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.DEFAULT_DATA, f, ensure_ascii=False, indent=2)
+            return dict(self.DEFAULT_DATA)
+
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                return dict(self.DEFAULT_DATA)
+            loaded.setdefault("label_map", {})
+            loaded.setdefault("fallback_rules", [])
+            return loaded
+        except Exception:
+            return dict(self.DEFAULT_DATA)
+
+    def reload(self) -> None:
+        self.data = self._load_or_create()
+
+    def map_label(self, label: str) -> str:
+        return self.data.get("label_map", {}).get(label, label)
+
+    def match_fallback_rule(
+        self,
+        motion_tag: str,
+        finger_pattern: Optional[Tuple[int, int, int, int, int]],
+    ) -> Optional[str]:
+        rules = self.data.get("fallback_rules", [])
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            rule_motion = rule.get("motion")
+            rule_fingers = rule.get("fingers")
+            rule_output = rule.get("output")
+            if not rule_output:
+                continue
+            if rule_motion and rule_motion != motion_tag:
+                continue
+            if rule_fingers is not None:
+                if finger_pattern is None:
+                    continue
+                if list(finger_pattern) != list(rule_fingers):
+                    continue
+            return str(rule_output)
+        return None
+
+
 @dataclass
 class RecognitionEvent:
     text: str
@@ -189,8 +266,9 @@ class RecognitionEvent:
 class DynamicGestureRecognizer:
     """Распознавание динамических жестов по последовательности landmarks."""
 
-    def __init__(self, lexicon_db: Optional[LexiconDB] = None) -> None:
+    def __init__(self, lexicon_db: Optional[LexiconDB] = None, user_cfg: Optional[UserGestureConfig] = None) -> None:
         self.lexicon_db = lexicon_db
+        self.user_cfg = user_cfg
         self.model = None
         self.labels: List[str] = []
         self.use_ml_model = False
@@ -338,6 +416,33 @@ class DynamicGestureRecognizer:
         }
         return static_map.get(dominant)
 
+    def _current_dominant_fingers(self) -> Optional[Tuple[int, int, int, int, int]]:
+        right = self._majority_finger_pattern(self.fingers_right)
+        left = self._majority_finger_pattern(self.fingers_left)
+        return right or left
+
+    def _motion_tag(self) -> str:
+        path = self.wrist_path_right if len(self.wrist_path_right) >= len(self.wrist_path_left) else self.wrist_path_left
+        metrics = self._motion_metrics(path)
+        if metrics is None:
+            return "unknown"
+        dx, dy, amp_x, amp_y = metrics
+        if amp_x > 0.20 and amp_y < 0.20:
+            return "horizontal"
+        if amp_y > 0.22 and amp_x < 0.20:
+            return "vertical"
+        if dx > 0.20:
+            return "right"
+        if dx < -0.20:
+            return "left"
+        if dy < -0.18:
+            return "up"
+        if dy > 0.18:
+            return "down"
+        if abs(dx) < 0.06 and abs(dy) < 0.06 and (amp_x + amp_y) < 0.12:
+            return "still"
+        return "unknown"
+
     def _decode_motion_phrase(self) -> Optional[str]:
         # Выбираем более длинную траекторию как доминирующую руку.
         path = self.wrist_path_right if len(self.wrist_path_right) >= len(self.wrist_path_left) else self.wrist_path_left
@@ -365,6 +470,14 @@ class DynamicGestureRecognizer:
         return None
 
     def _fallback_prediction(self) -> Optional[str]:
+        motion_tag = self._motion_tag()
+        dominant_fingers = self._current_dominant_fingers()
+
+        if self.user_cfg is not None:
+            custom = self.user_cfg.match_fallback_rule(motion_tag, dominant_fingers)
+            if custom:
+                return custom
+
         motion = self._decode_motion_phrase()
         static = self._decode_static_phrase()
 
@@ -394,6 +507,7 @@ class DynamicGestureRecognizer:
             best_prob = float(probs[best_idx])
             if best_prob >= PREDICTION_THRESHOLD and best_idx < len(self.labels):
                 resolved = self.lexicon_db.resolve(self.labels[best_idx]) if self.lexicon_db else self.labels[best_idx]
+                resolved = self.user_cfg.map_label(resolved) if self.user_cfg else resolved
                 voted = self._emit_with_voting(resolved)
                 self.last_emit_time = now
                 return voted
@@ -401,6 +515,7 @@ class DynamicGestureRecognizer:
 
         fallback_label = self._fallback_prediction()
         if fallback_label:
+            fallback_label = self.user_cfg.map_label(fallback_label) if self.user_cfg else fallback_label
             voted = self._emit_with_voting(fallback_label)
             self.last_emit_time = now
             return voted
@@ -414,7 +529,8 @@ class SignLanguageApp:
         self.root.geometry("1200x760")
 
         self.lexicon_db = LexiconDB()
-        self.recognizer = DynamicGestureRecognizer(self.lexicon_db)
+        self.user_cfg = UserGestureConfig()
+        self.recognizer = DynamicGestureRecognizer(self.lexicon_db, self.user_cfg)
 
         self.mp_hands = mp.solutions.hands
         self.mp_draw = mp.solutions.drawing_utils
@@ -452,7 +568,7 @@ class SignLanguageApp:
     def _status_text(self) -> str:
         if self.recognizer.use_ml_model:
             return "Режим: ML-модель (рекомендуется для точности >=90%)"
-        return f"Режим: fallback-словарь ({len(FALLBACK_VOCAB)} фраз) + БД {self.lexicon_db.count_tokens()} слов, подключите model.h5 для лучшей точности"
+        return f"Режим: fallback-словарь ({len(FALLBACK_VOCAB)} фраз) + БД {self.lexicon_db.count_tokens()} слов + user_gestures.json"
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=12)
@@ -486,6 +602,7 @@ class SignLanguageApp:
         ttk.Button(control_frame, text="🔊 Озвучить текст", command=self.speak_current_text).pack(side=tk.LEFT, padx=4)
         ttk.Button(control_frame, text="🧹 Очистить историю", command=self.clear_history).pack(side=tk.LEFT, padx=4)
         ttk.Button(control_frame, text="🔄 Перезапуск распознавания", command=self.restart_recognition).pack(side=tk.LEFT, padx=4)
+        ttk.Button(control_frame, text="📥 Перезагрузить жесты", command=self.reload_user_gestures).pack(side=tk.LEFT, padx=4)
 
         history_frame = ttk.LabelFrame(right, text="История сообщений", padding=10)
         history_frame.pack(fill=tk.BOTH, expand=True)
@@ -582,6 +699,10 @@ class SignLanguageApp:
         self.recognizer.reset()
         self.current_text_var.set("")
         self.status_var.set(self._status_text() + " | Буферы очищены")
+
+    def reload_user_gestures(self) -> None:
+        self.user_cfg.reload()
+        self.status_var.set(self._status_text() + " | user_gestures.json перезагружен")
 
     def _process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
