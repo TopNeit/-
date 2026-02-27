@@ -19,6 +19,9 @@ import importlib.util
 import json
 import os
 import sqlite3
+
+# Совместимость MediaPipe/Protobuf на части Windows-окружений.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import threading
 import time
 from collections import Counter, deque
@@ -27,13 +30,18 @@ from datetime import datetime
 from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
-import mediapipe as mp
+try:
+    import mediapipe as mp
+except Exception as mediapipe_import_error:
+    mp = None
 import numpy as np
 import pyttsx3
 import tkinter as tk
 from PIL import Image, ImageTk
 from tkinter import messagebox, ttk
 
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 if importlib.util.find_spec("tensorflow") is not None:
     from tensorflow.keras.models import load_model
@@ -531,6 +539,12 @@ class SignLanguageApp:
         self.lexicon_db = LexiconDB()
         self.user_cfg = UserGestureConfig()
         self.recognizer = DynamicGestureRecognizer(self.lexicon_db, self.user_cfg)
+
+        if mp is None:
+            raise RuntimeError(
+                "MediaPipe не импортирован. Частая причина: несовместимые версии protobuf/mediapipe. "
+                "Переустановите зависимости из requirements.txt"
+            )
 
         self.mp_hands = mp.solutions.hands
         self.mp_draw = mp.solutions.drawing_utils

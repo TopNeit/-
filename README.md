@@ -54,3 +54,25 @@ python add_new_gesture.py
 3. В консоли введите название жеста (например, `три пальца`).
 4. Скрипт добавит правило в `user_gestures.json`.
 5. В основном приложении нажмите **📥 Перезагрузить жесты**.
+
+
+## Если на Windows ошибка `MessageFactory/GetPrototype` или `FieldDescriptor.label`
+Это конфликт версий `mediapipe` и `protobuf`.
+
+Сделайте в новом venv:
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Если ставили пакеты вручную раньше, принудительно переустановите:
+```bash
+pip uninstall -y mediapipe protobuf tensorflow
+pip install -r requirements.txt
+```
+
+Дополнительно в коде уже включён режим совместимости:
+- `PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python`
+- перехват ошибки импорта MediaPipe с понятным сообщением.

@@ -13,11 +13,17 @@ from __future__ import annotations
 
 import json
 import os
+
+# Совместимость MediaPipe/Protobuf на части Windows-окружений.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 from collections import Counter, deque
 from typing import Deque, List, Optional, Tuple
 
 import cv2
-import mediapipe as mp
+try:
+    import mediapipe as mp
+except Exception:
+    mp = None
 
 USER_GESTURES_PATH = "user_gestures.json"
 SEQUENCE_FRAMES = 20
@@ -67,6 +73,11 @@ def save_config(path: str, data: dict) -> None:
 
 
 def main() -> None:
+    if mp is None:
+        print("Ошибка: MediaPipe не импортировался (обычно из-за конфликта protobuf/mediapipe).")
+        print("Переустановите зависимости строго из requirements.txt")
+        return
+
     mp_hands = mp.solutions.hands
     mp_draw = mp.solutions.drawing_utils
 
